@@ -283,6 +283,142 @@ TEST_F(MemoryTest, TesetMemoryCacheRead) {
                                                        // old cache
 }
 
+TEST_F(MemoryTest, TestL1CacheOverlapAndFlush) {
+  ArchSpec arch("arm64-apple-macosx");
+
+  Platform::SetHostPlatform(PlatformRemoteMacOSX::CreateInstance(true, &arch));
+
+  DebuggerSP debugger_sp = Debugger::CreateInstance();
+  ASSERT_TRUE(debugger_sp);
+
+  TargetSP target_sp = CreateTarget(debugger_sp, arch);
+  ASSERT_TRUE(target_sp);
+
+  ProcessSP process_sp = CreateProcess(target_sp);
+  ASSERT_TRUE(process_sp);
+
+  DummyProcess *process = static_cast<DummyProcess *>(process_sp.get());
+  MemoryCache &mem_cache = process->GetMemoryCache();
+  Status error;
+
+  auto add = [&](lldb::addr_t addr, size_t size, uint8_t fill) {
+    mem_cache.AddL1CacheData(addr,
+                             std::make_shared<DataBufferHeap>(size, fill));
+  };
+
+  auto read_sp = std::make_shared<DataBufferHeap>(0x400, 0);
+  auto l1_read = [&](lldb::addr_t addr, size_t size) -> size_t {
+    process->SetMaxReadSize(0);
+    memset(read_sp->GetBytes(), 0, size);
+    return mem_cache.Read(addr, read_sp->GetBytes(), size, error);
+  };
+  auto bytes_in = [&](size_t offset, size_t len, uint8_t val) -> bool {
+    const uint8_t *bytes = read_sp->GetBytes();
+    for (size_t i = offset; i < offset + len; ++i)
+      if (bytes[i] != val)
+        return false;
+    return true;
+  };
+
+  // Partial overlap (extend right): both chunks are kept and each serves reads
+  // fully inside itself; a read spanning both misses.
+  mem_cache.Clear();
+  add(0x1000, 0x100, 0xAA);
+  add(0x1080, 0x100, 0xBB);
+  EXPECT_EQ(l1_read(0x1000, 0x100), 0x100u);
+  EXPECT_TRUE(bytes_in(0x0, 0x100, 0xAA));
+  EXPECT_EQ(l1_read(0x1080, 0x100), 0x100u);
+  EXPECT_TRUE(bytes_in(0x0, 0x100, 0xBB));
+  EXPECT_NE(l1_read(0x1000, 0x180), 0x180u);
+
+  // Partial overlap (extend left): symmetric to the above.
+  mem_cache.Clear();
+  add(0x2080, 0x100, 0xAA);
+  add(0x2000, 0x100, 0xBB);
+  EXPECT_EQ(l1_read(0x2000, 0x100), 0x100u);
+  EXPECT_TRUE(bytes_in(0x0, 0x100, 0xBB));
+  EXPECT_EQ(l1_read(0x2080, 0x100), 0x100u);
+  EXPECT_TRUE(bytes_in(0x0, 0x100, 0xAA));
+  EXPECT_NE(l1_read(0x2000, 0x180), 0x180u);
+
+  // A new range that fully contains an existing chunk drops that chunk,
+  // leaving only the new, larger chunk.
+  mem_cache.Clear();
+  add(0x3040, 0x40, 0xAA);
+  add(0x3000, 0x100, 0xBB);
+  EXPECT_EQ(l1_read(0x3000, 0x100), 0x100u);
+  EXPECT_TRUE(bytes_in(0x0, 0x100, 0xBB));
+
+  // A new range fully contained by an existing chunk is skipped; the enclosing
+  // chunk keeps serving the sub-range.
+  mem_cache.Clear();
+  add(0x4000, 0x200, 0xAA);
+  add(0x4080, 0x80, 0xBB);
+  EXPECT_EQ(l1_read(0x4000, 0x200), 0x200u);
+  EXPECT_TRUE(bytes_in(0x0, 0x200, 0xAA));
+  EXPECT_EQ(l1_read(0x4080, 0x80), 0x80u);
+  EXPECT_TRUE(bytes_in(0x0, 0x80, 0xAA));
+
+  // Partial overlap (bridge): three chunks with pairwise partial overlap and no
+  // containment are all kept.
+  mem_cache.Clear();
+  add(0x5000, 0x80, 0xAA);
+  add(0x5100, 0x80, 0xCC);
+  add(0x5040, 0x100, 0xBB);
+  EXPECT_EQ(l1_read(0x5000, 0x80), 0x80u);
+  EXPECT_TRUE(bytes_in(0x0, 0x80, 0xAA));
+  EXPECT_EQ(l1_read(0x5040, 0x100), 0x100u);
+  EXPECT_TRUE(bytes_in(0x0, 0x100, 0xBB));
+  EXPECT_EQ(l1_read(0x5100, 0x80), 0x80u);
+  EXPECT_TRUE(bytes_in(0x0, 0x80, 0xCC));
+  EXPECT_NE(l1_read(0x5000, 0x180), 0x180u);
+
+  // Disjoint chunks stay separate.
+  mem_cache.Clear();
+  add(0x6000, 0x80, 0xAA);
+  add(0x6100, 0x80, 0xBB);
+  EXPECT_EQ(l1_read(0x6000, 0x80), 0x80u);
+  EXPECT_TRUE(bytes_in(0x0, 0x80, 0xAA));
+  EXPECT_EQ(l1_read(0x6100, 0x80), 0x80u);
+  EXPECT_TRUE(bytes_in(0x0, 0x80, 0xBB));
+  EXPECT_NE(l1_read(0x6000, 0x180), 0x180u);
+
+  // Adjacent (touching but not overlapping) chunks stay separate.
+  mem_cache.Clear();
+  add(0x7000, 0x80, 0xAA);
+  add(0x7080, 0x80, 0xBB);
+  EXPECT_NE(l1_read(0x7000, 0x100), 0x100u);
+
+  // Flush must drop every chunk intersecting the flush range, including a chunk
+  // that starts below the flushed address. Here 0x8140 is covered only by the
+  // lower-starting, longer chunk; after the flush the re-read comes from the
+  // process rather than returning stale bytes.
+  mem_cache.Clear();
+  add(0x8000, 0x180, 0xAA);
+  add(0x8080, 0x40, 0xBB);
+  mem_cache.Flush(0x8140, 0x4);
+  process->SetFiller(0xDD);
+  process->SetMaxReadSize(0x1000);
+  ASSERT_EQ(mem_cache.Read(0x8140, read_sp->GetBytes(), 0x4, error), 0x4u);
+  EXPECT_TRUE(bytes_in(0x0, 0x4, 0xDD));
+
+  // A flush intersecting several partially overlapping chunks drops all of
+  // them, while a chunk it does not intersect is left in place.
+  mem_cache.Clear();
+  add(0x9000, 0x80, 0xAA);
+  add(0x9040, 0x100, 0xBB);
+  add(0x9100, 0x80, 0xCC);
+  mem_cache.Flush(0x9060, 0x1);
+  process->SetFiller(0xDD);
+  process->SetMaxReadSize(0x1000);
+  for (lldb::addr_t a : {0x9000u, 0x9040u, 0x9060u, 0x90ffu}) {
+    ASSERT_EQ(mem_cache.Read(a, read_sp->GetBytes(), 0x1, error), 0x1u);
+    EXPECT_TRUE(bytes_in(0x0, 0x1, 0xDD));
+  }
+  EXPECT_EQ(l1_read(0x9100, 0x80), 0x80u);
+  EXPECT_TRUE(bytes_in(0x0, 0x80, 0xCC));
+}
+
 TEST_F(MemoryTest, TestReadInteger) {
   ArchSpec arch("x86_64-apple-macosx-");
 

@@ -63,9 +63,15 @@ protected:
   typedef Range<lldb::addr_t, lldb::addr_t> AddrRange;
   // Classes that inherit from MemoryCache can see and modify these
   std::recursive_mutex m_mutex;
-  BlockMap m_L1_cache; // A first level memory cache whose chunk sizes vary that
-                       // will be used only if the memory read fits entirely in
-                       // a chunk
+  // A first level memory cache whose chunk sizes vary, used only if a read fits
+  // entirely in a chunk. Chunks may partially overlap, but no chunk is ever
+  // fully contained in another: AddL1CacheData skips an insert already covered
+  // by an existing chunk and drops existing chunks the new one covers.
+  BlockMap m_L1_cache;
+  // The largest chunk length ever inserted into m_L1_cache, used to bound the
+  // scan window in AddL1CacheData/Flush/FindL1CacheEntry so they find every
+  // chunk reaching into an address even when it starts below that address.
+  size_t m_L1_max_chunk_byte_size = 0;
   BlockMap m_L2_cache; // A memory cache of fixed size chinks
                        // (m_L2_cache_line_byte_size bytes in size each)
   InvalidRanges m_invalid_ranges;
@@ -77,6 +83,11 @@ private:
   const MemoryCache &operator=(const MemoryCache &) = delete;
 
   lldb::DataBufferSP GetL2CacheLine(lldb::addr_t addr, Status &error);
+
+  // Returns the lowest address at which a cached chunk could still reach into
+  // addr, i.e. addr minus the largest chunk length seen (clamped, never
+  // underflowing). Caller must hold m_mutex.
+  lldb::addr_t GetLowestPossibleChunkStart(lldb::addr_t addr) const;
 
   // If the entire range [addr, addr+len) is covered by a single L1 entry,
   // returns a pointer into that entry's data at the correct offset. Returns

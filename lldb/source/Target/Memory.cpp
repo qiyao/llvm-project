@@ -16,6 +16,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <memory>
 
@@ -34,6 +35,7 @@ MemoryCache::~MemoryCache() = default;
 void MemoryCache::Clear(bool clear_invalid_ranges) {
   std::lock_guard<std::recursive_mutex> guard(m_mutex);
   m_L1_cache.clear();
+  m_L1_max_chunk_byte_size = 0;
   m_L2_cache.clear();
   if (clear_invalid_ranges)
     m_invalid_ranges.Clear();
@@ -45,10 +47,37 @@ void MemoryCache::AddL1CacheData(lldb::addr_t addr, const void *src,
   AddL1CacheData(addr, std::make_shared<DataBufferHeap>(src, src_len));
 }
 
+addr_t MemoryCache::GetLowestPossibleChunkStart(addr_t addr) const {
+  if (m_L1_max_chunk_byte_size == 0)
+    return addr;
+  const addr_t max_reach = m_L1_max_chunk_byte_size - 1;
+  return addr >= max_reach ? addr - max_reach : 0;
+}
+
 void MemoryCache::AddL1CacheData(lldb::addr_t addr,
                                  const DataBufferSP &data_buffer_sp) {
   std::lock_guard<std::recursive_mutex> guard(m_mutex);
+  const size_t data_byte_size = data_buffer_sp->GetByteSize();
+  if (data_byte_size == 0)
+    return;
+
+  AddrRange new_range(addr, data_byte_size);
+  addr_t lowest_possible_start = GetLowestPossibleChunkStart(addr);
+
+  BlockMap::iterator pos = m_L1_cache.lower_bound(lowest_possible_start);
+  while (pos != m_L1_cache.end() && pos->first < new_range.GetRangeEnd()) {
+    AddrRange chunk_range(pos->first, pos->second->GetByteSize());
+    if (chunk_range.Contains(new_range))
+      return;
+    if (new_range.Contains(chunk_range)) {
+      pos = m_L1_cache.erase(pos);
+      continue;
+    }
+    ++pos;
+  }
+
   m_L1_cache[addr] = data_buffer_sp;
+  m_L1_max_chunk_byte_size = std::max(m_L1_max_chunk_byte_size, data_byte_size);
 }
 
 void MemoryCache::Flush(addr_t addr, size_t size) {
@@ -57,18 +86,19 @@ void MemoryCache::Flush(addr_t addr, size_t size) {
 
   std::lock_guard<std::recursive_mutex> guard(m_mutex);
 
-  // Erase any blocks from the L1 cache that intersect with the flush range
+  // Erase any blocks from the L1 cache that intersect with the flush range. A
+  // chunk that intersects cannot start earlier than this, so scan a bounded
+  // window rather than the whole cache.
   if (!m_L1_cache.empty()) {
     AddrRange flush_range(addr, size);
-    BlockMap::iterator pos = m_L1_cache.upper_bound(addr);
-    if (pos != m_L1_cache.begin()) {
-      --pos;
-    }
-    while (pos != m_L1_cache.end()) {
+    addr_t lowest_possible_start = GetLowestPossibleChunkStart(addr);
+    BlockMap::iterator pos = m_L1_cache.lower_bound(lowest_possible_start);
+    while (pos != m_L1_cache.end() && pos->first < flush_range.GetRangeEnd()) {
       AddrRange chunk_range(pos->first, pos->second->GetByteSize());
-      if (!chunk_range.DoesIntersect(flush_range))
-        break;
-      pos = m_L1_cache.erase(pos);
+      if (chunk_range.DoesIntersect(flush_range))
+        pos = m_L1_cache.erase(pos);
+      else
+        ++pos;
     }
   }
 
@@ -129,13 +159,14 @@ const uint8_t *MemoryCache::FindL1CacheEntry(lldb::addr_t addr,
   if (m_L1_cache.empty())
     return nullptr;
   AddrRange read_range(addr, len);
-  BlockMap::const_iterator pos = m_L1_cache.upper_bound(addr);
-  if (pos != m_L1_cache.begin())
-    --pos;
-  AddrRange chunk_range(pos->first, pos->second->GetByteSize());
-  if (!chunk_range.Contains(read_range))
-    return nullptr;
-  return pos->second->GetBytes() + (addr - chunk_range.GetRangeBase());
+  addr_t lowest_possible_start = GetLowestPossibleChunkStart(addr);
+  BlockMap::const_iterator pos = m_L1_cache.lower_bound(lowest_possible_start);
+  for (; pos != m_L1_cache.end() && pos->first <= addr; ++pos) {
+    AddrRange chunk_range(pos->first, pos->second->GetByteSize());
+    if (chunk_range.Contains(read_range))
+      return pos->second->GetBytes() + (addr - chunk_range.GetRangeBase());
+  }
+  return nullptr;
 }
 
 lldb::DataBufferSP MemoryCache::GetL2CacheLine(lldb::addr_t line_base_addr,
